@@ -1,0 +1,8 @@
+.venv/
+credentials.json
+token.json
+jobmail.db
+*.log
+.env
+.daily_alert
+__pycache__/
