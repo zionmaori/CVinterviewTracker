@@ -3,7 +3,9 @@
 Every N minutes: pulls new Gmail messages, asks Claude whether each one is about
 a job application and what stage it signals, applies a Gmail label
 (Jobs/Interview, Jobs/Declined, Jobs/Not Relevant, Jobs/Under Review), and
-records it in SQLite. A local dashboard is served at http://localhost:8765.
+records it in SQLite. It also picks flight bookings out of Gmail and reads the
+Google Calendar so both show on the dashboard calendar.
+A local dashboard is served at http://localhost:8765.
 """
 
 import argparse
@@ -39,7 +41,8 @@ ENV_PATH = ROOT / ".env"
 DASHBOARD_PATH = ROOT / "dashboard.html"
 DAILY_ALERT_STATE = ROOT / ".daily_alert"  # date the daily alert was last shown
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+SCOPES = ["https://www.googleapis.com/auth/gmail.modify",
+          "https://www.googleapis.com/auth/calendar.readonly"]
 MODEL = "claude-opus-5-5"
 
 CATEGORIES = {
@@ -62,6 +65,16 @@ GMAIL_QUERY = (
     "greenhouse OR lever OR workday OR ashby OR smartrecruiters)"
 )
 
+# Flight bookings, confirmations, check-in and change/cancel emails. Promotions are skipped
+# (airline ads); Claude decides whether a message is really a booking.
+FLIGHT_QUERY = (
+    "-in:sent -in:chats -category:promotions ("
+    "flight OR flights OR boarding OR itinerary OR \"e-ticket\" OR eticket OR "
+    "\"booking reference\" OR \"booking confirmation\" OR \"confirmation number\" OR PNR OR "
+    "\"check-in\" OR \"check in\" OR טיסה OR טיסות)"
+)
+FLIGHT_DAYS = 365  # flights are often booked months ahead
+
 # Bodies are capped so a huge HTML email can't blow up cost; job-status emails
 # are short, and the status is almost always in the first few paragraphs.
 MAX_BODY_CHARS = 15000
@@ -81,7 +94,11 @@ candidate withdrew — the application is dead but not because of a rejection.
 updates without a decision.
 
 Set is_job_related=false for job alerts, job-board newsletters, marketing, cold \
-recruiter spam about roles they never applied to, and anything unrelated. When \
+recruiter spam about roles they never applied to, and anything unrelated. Also for \
+requests for the candidate's feedback — candidate-experience surveys, "how did your \
+interview go?", "rate your experience" (e.g. from Spark Hire, Greenhouse or Comeet) — \
+since they say nothing about where the application stands. An email that does carry a \
+decision or next step is still classified normally, even if it also mentions feedback. When \
 is_job_related is false, set category to "under_review" (it is ignored).
 
 company: the company's short common name without legal suffixes (e.g. "Claroty", \
@@ -114,8 +131,45 @@ OUTPUT_SCHEMA = {
     "additionalProperties": False,
 }
 
+FLIGHT_PROMPT = """You read one email and pull out the flights in it, if it is a booking, \
+e-ticket, itinerary, check-in, boarding pass, schedule change or cancellation for an actual \
+trip (the reader's own, or one they booked). Set is_flight_booking=false and flights=[] for \
+airline ads, price alerts, newsletters, loyalty statements and anything else.
+
+For each flight segment: airline name; flight_number as carrier code + number like "LY 315"; \
+from_code / to_code as IATA airport codes; from_city / to_city; depart_at as the departure's \
+local time at the origin airport with that airport's UTC offset on that date, \
+"YYYY-MM-DDTHH:MM+HH:MM"; arrive_at the same way at the destination airport. Resolve a \
+missing year from the email's date. Use "" for anything not stated. status: "cancelled" if \
+the email cancels that flight, otherwise "booked". confirmation: the booking reference / PNR, \
+or ""."""
+
+FLIGHT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "is_flight_booking": {"type": "boolean"},
+        "confirmation": {"type": "string"},
+        "flights": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {k: {"type": "string"} for k in (
+                    "airline", "flight_number", "from_code", "from_city", "to_code", "to_city",
+                    "depart_at", "arrive_at")} | {"status": {"type": "string", "enum": ["booked", "cancelled"]}},
+                "required": ["airline", "flight_number", "from_code", "from_city", "to_code", "to_city",
+                             "depart_at", "arrive_at", "status"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["is_flight_booking", "confirmation", "flights"],
+    "additionalProperties": False,
+}
+
 state_lock = threading.Lock()
-state = {"last_run": None, "next_run": None, "running": False, "error": None, "interval": None}
+state = {"last_run": None, "next_run": None, "running": False, "error": None, "interval": None,
+         "events": [], "calendar_error": None}
+CALENDAR_DAYS_AHEAD = 90
 run_now = threading.Event()
 
 
@@ -158,6 +212,15 @@ def init_db():
             )"""
         )
         conn.execute("CREATE TABLE IF NOT EXISTS company_labeled (id TEXT PRIMARY KEY)")
+        conn.execute("CREATE TABLE IF NOT EXISTS flight_emails (id TEXT PRIMARY KEY, is_flight INTEGER, processed_at TEXT)")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS flights (
+                email_id TEXT, idx INTEGER, thread_id TEXT, received_at TEXT, airline TEXT,
+                flight_number TEXT, from_code TEXT, from_city TEXT, to_code TEXT, to_city TEXT,
+                depart_at TEXT, arrive_at TEXT, status TEXT, confirmation TEXT,
+                PRIMARY KEY (email_id, idx)
+            )"""
+        )
         columns = {r["name"] for r in conn.execute("PRAGMA table_info(emails)")}
         for col in ("interview_at", "interview_details"):
             if col not in columns:  # added after the first version; NULL = not extracted yet
@@ -196,10 +259,13 @@ def mark_company_labeled(msg_id):
 
 # ---------- gmail ----------
 
-def gmail_service():
+def google_creds():
     creds = None
     if TOKEN_PATH.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+        # Load with the token's own saved scopes (passing SCOPES would just overwrite them).
+        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH))
+        if not creds.has_scopes(SCOPES):  # token from before a permission was added: sign in again
+            creds = None
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
@@ -209,7 +275,11 @@ def gmail_service():
             flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_PATH), SCOPES)
             creds = flow.run_local_server(port=0)
         TOKEN_PATH.write_text(creds.to_json())
-    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+    return creds
+
+
+def gmail_service():
+    return build("gmail", "v1", credentials=google_creds(), cache_discovery=False)
 
 
 def ensure_labels(svc):
@@ -251,8 +321,8 @@ def backfill_company_labels(svc, labels):
         print(f"  added company labels to {len(rows)} earlier emails")
 
 
-def list_new_message_ids(svc, days):
-    query = f"{GMAIL_QUERY} newer_than:{days}d"
+def list_new_message_ids(svc, days, base_query=GMAIL_QUERY):
+    query = f"{base_query} newer_than:{days}d"
     ids, page = [], None
     while True:
         resp = svc.users().messages().list(userId="me", q=query, pageToken=page, maxResults=100).execute()
@@ -305,6 +375,51 @@ def fetch_message(svc, msg_id):
     }
 
 
+# ---------- google calendar ----------
+
+def fetch_calendar_events():
+    """Upcoming events from the primary Google Calendar (read-only), kept in memory for the dashboard."""
+    svc = build("calendar", "v3", credentials=google_creds(), cache_discovery=False)
+    now = datetime.now(timezone.utc)
+    events, page = [], None
+    while True:
+        resp = svc.events().list(
+            calendarId="primary", singleEvents=True, orderBy="startTime", pageToken=page, maxResults=250,
+            timeMin=(now - timedelta(days=1)).isoformat(),
+            timeMax=(now + timedelta(days=CALENDAR_DAYS_AHEAD)).isoformat(),
+        ).execute()
+        for e in resp.get("items", []):
+            if e.get("status") == "cancelled" or "start" not in e:
+                continue
+            all_day = "date" in e["start"]
+            events.append({
+                "id": e["id"],
+                "title": e.get("summary", "(no title)"),
+                "start": e["start"]["date"] if all_day else e["start"]["dateTime"],
+                "end": e["end"]["date"] if all_day else e["end"]["dateTime"],
+                "all_day": all_day,
+                "location": e.get("location", ""),
+                "link": e.get("htmlLink", ""),
+                "meet": e.get("hangoutLink", ""),
+            })
+        page = resp.get("nextPageToken")
+        if not page:
+            return events
+
+
+def sync_calendar():
+    try:
+        events = fetch_calendar_events()
+    except Exception as e:  # the Gmail sorting keeps working without the calendar
+        print(f"Calendar sync failed: {e!r}")
+        with state_lock:
+            state["calendar_error"] = repr(e)
+        return
+    with state_lock:
+        state.update(events=events, calendar_error=None)
+    print(f"  {len(events)} calendar events")
+
+
 # ---------- claude ----------
 
 def classify(client, email, companies):
@@ -329,6 +444,60 @@ def classify(client, email, companies):
         return None
     text = next(b.text for b in response.content if b.type == "text")
     return json.loads(text)
+
+
+def extract_flights(client, email):
+    response = client.beta.messages.create(
+        model=MODEL,
+        max_tokens=2048,
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",
+        output_config={"effort": "low", "format": {"type": "json_schema", "schema": FLIGHT_SCHEMA}},
+        system=FLIGHT_PROMPT,
+        messages=[{
+            "role": "user",
+            "content": f"From: {email['sender']}\nSubject: {email['subject']}\n"
+                       f"Date: {email['received_at']}\n\n{email['body']}",
+        }],
+    )
+    if response.stop_reason == "refusal":
+        return None
+    return json.loads(next(b.text for b in response.content if b.type == "text"))
+
+
+# ---------- flights ----------
+
+def sync_flights():
+    """Pull flight bookings out of new Gmail messages. Each email is read only once."""
+    svc = gmail_service()
+    client = anthropic.Anthropic()
+    with db() as conn:
+        seen = {r["id"] for r in conn.execute("SELECT id FROM flight_emails")}
+    new_ids = [i for i in list_new_message_ids(svc, FLIGHT_DAYS, FLIGHT_QUERY) if i not in seen]
+    if new_ids:
+        print(f"  {len(new_ids)} new possible flight emails")
+    for msg_id in new_ids:
+        email = fetch_message(svc, msg_id)
+        try:
+            result = extract_flights(client, email) or {"is_flight_booking": False, "flights": [], "confirmation": ""}
+        except anthropic.RateLimitError:
+            print("  rate limited; will look for the remaining flights next run")
+            break
+        except anthropic.APIStatusError as e:
+            print(f"  Claude error on {email['subject']!r}: {e.status_code}; will retry next run")
+            continue
+        with db() as conn:
+            for idx, f in enumerate(result["flights"] if result["is_flight_booking"] else []):
+                conn.execute(
+                    """INSERT OR REPLACE INTO flights VALUES
+                       (:email_id, :idx, :thread_id, :received_at, :airline, :flight_number, :from_code,
+                        :from_city, :to_code, :to_city, :depart_at, :arrive_at, :status, :confirmation)""",
+                    {**f, "email_id": msg_id, "idx": idx, "thread_id": email["thread_id"],
+                     "received_at": email["received_at"], "confirmation": result["confirmation"]},
+                )
+                print(f"  flight {f['flight_number']} {f['from_code']}→{f['to_code']} {f['depart_at']} ({f['status']})")
+            conn.execute("INSERT INTO flight_emails VALUES (?, ?, ?)",
+                         (msg_id, int(result["is_flight_booking"]), datetime.now(timezone.utc).isoformat()))
 
 
 # ---------- the sorting run ----------
@@ -468,6 +637,11 @@ def poll_loop(interval_min, days):
             print(f"Run failed: {e!r}")
             with state_lock:
                 state["error"] = repr(e)
+        try:
+            sync_flights()
+        except Exception as e:  # flights are extra; don't stop the job sorting over them
+            print(f"Flight sync failed: {e!r}")
+        sync_calendar()
         now = time.time()
         with state_lock:
             state.update(running=False, last_run=now, next_run=now + interval_min * 60)
@@ -482,8 +656,10 @@ def dashboard_data():
         rows = [dict(r) for r in conn.execute(
             "SELECT * FROM emails WHERE is_job_related = 1 ORDER BY received_at DESC"
         )]
+        flights = [dict(r) for r in conn.execute("SELECT * FROM flights WHERE depart_at != ''")]
     with state_lock:
-        return {"state": dict(state), "emails": rows}
+        s = dict(state)
+    return {"state": s, "emails": rows, "events": s.pop("events"), "flights": flights}
 
 
 def lan_ip():
@@ -581,7 +757,7 @@ def main():
         run_once(args.days)
         return
 
-    gmail_service()  # do the OAuth browser flow up front, before going into the background loop
+    google_creds()  # do the OAuth browser flow up front, before going into the background loop
     state["interval"] = args.interval
     threading.Thread(target=poll_loop, args=(args.interval, args.days), daemon=True).start()
 
